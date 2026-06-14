@@ -1,0 +1,12 @@
+venv/
+
+models/
+*.keras
+*.h5
+*.pth
+
+data/
+logs/
+
+__pycache__/
+*.pyc

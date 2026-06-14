@@ -1,0 +1,15 @@
+# render.yaml — One-click deployment on Render.com
+# Push to GitHub, connect the repo on render.com, done.
+
+services:
+  - type: web
+    name: vit-cifar10
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app.app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: "2"
+    healthCheckPath: /health
