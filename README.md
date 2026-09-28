@@ -2,7 +2,7 @@
 
 A Vision Transformer built from scratch in PyTorch, trained on CIFAR-10, and served through a Flask web app and REST API.
 
-**77.9% test accuracy** with a compact **326,602-parameter** model trained for 60 epochs on an RTX 5050 (no pretraining).
+**78.8% test accuracy** with a compact **326,602-parameter** model trained on an RTX 5050 (no pretraining; best checkpoint at epoch 53, 77.5% validation accuracy).
 
 ![Training curves](docs/training_curves_torch.png)
 
@@ -10,11 +10,11 @@ A Vision Transformer built from scratch in PyTorch, trained on CIFAR-10, and ser
 
 | Class | Accuracy | Class | Accuracy |
 | --- | --- | --- | --- |
-| automobile | 89.6% | ship | 83.7% |
-| truck | 86.1% | airplane | 83.0% |
-| horse | 84.7% | dog | 74.2% |
-| frog | 84.1% | deer | 70.4% |
-| bird | 69.8% | cat | 53.2% |
+| automobile | 89.1% | horse | 83.4% |
+| ship | 86.2% | airplane | 83.3% |
+| truck | 86.2% | dog | 75.8% |
+| frog | 85.6% | bird | 72.3% |
+| deer | 71.9% | cat | 53.7% |
 
 Vehicles, which have rigid shapes, score highest. Cat is the hardest class because at 32×32 it is often confused with dog.
 
