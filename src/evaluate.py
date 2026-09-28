@@ -1,10 +1,11 @@
 """
-evaluate_torch.py
------------------
-Loads the PyTorch ViT checkpoint and runs full evaluation.
+evaluate.py
+-----------
+Loads the trained ViT checkpoint and evaluates it on the 10,000-image CIFAR-10 test set:
+accuracy, classification report, confusion matrix and per-class accuracy.
 
 Usage:
-    python src/evaluate_torch.py
+    python src/evaluate.py
 """
 
 import os
@@ -18,25 +19,18 @@ import torch
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.vit_model import ViT
-from src.train import get_dataloaders
+from src.data_preprocessing import get_dataloaders, CLASS_NAMES
+from src.inference import DEFAULT_MODEL_PATH as MODEL_PATH, load_model as _load_model
 
 ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(ROOT, "models", "vit_cifar10_torch.pth")
 DOCS_DIR   = os.path.join(ROOT, "docs")
 os.makedirs(DOCS_DIR, exist_ok=True)
 
-CLASS_NAMES = ["airplane","automobile","bird","cat","deer",
-               "dog","frog","horse","ship","truck"]
-
 
 def load_model(path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ViT().to(device)
-    ckpt   = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    print(f"Loaded checkpoint from epoch {ckpt['epoch']}  val_acc={ckpt['val_acc']:.4f}")
+    model, device, ckpt = _load_model(path)
+    if "epoch" in ckpt:
+        print(f"Loaded checkpoint from epoch {ckpt['epoch']}  val_acc={ckpt.get('val_acc', float('nan')):.4f}")
     return model, device
 
 
@@ -96,7 +90,7 @@ def plot_per_class_accuracy(y_true, y_pred):
 
 def main():
     if not os.path.exists(MODEL_PATH):
-        print(f"Model not found at {MODEL_PATH}\nRun  python src/train_torch.py  first.")
+        print(f"Model not found at {MODEL_PATH}\nRun  python src/train.py  first.")
         return
 
     _, _, test_loader = get_dataloaders(batch_size=128)

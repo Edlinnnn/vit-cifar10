@@ -1,12 +1,17 @@
 venv/
+.venv/
 
-models/
+# Model artefacts: ignore everything except the small trained checkpoint (~1.3 MB)
+models/*
+!models/.gitkeep
+!models/vit_cifar10_torch.pth
 *.keras
 *.h5
-*.pth
 
 data/
 logs/
 
 __pycache__/
 *.pyc
+.pytest_cache/
+.ipynb_checkpoints/

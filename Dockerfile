@@ -1,43 +1,35 @@
-# ── Build stage ───────────────────────────────────────────────────────────────
-FROM python:3.10-slim AS builder
+# ── Build stage: install dependencies into a virtualenv ───────────────────────
+FROM python:3.11-slim AS builder
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
-
-# Install dependencies into a clean layer
-COPY requirements.txt .
+COPY requirements-serve.txt .
+# CPU-only PyTorch wheels are ~5x smaller than the default CUDA build
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+ && pip install --no-cache-dir -r requirements-serve.txt
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM python:3.10-slim
+# ── Runtime stage: only the venv and the code ─────────────────────────────────
+FROM python:3.11-slim
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PORT=8080 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
-
-# Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copy project files
-COPY src/       ./src/
-COPY app/       ./app/
-COPY models/    ./models/
+COPY src/    ./src/
+COPY app/    ./app/
+COPY models/ ./models/
 
 # Non-root user for security
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
-EXPOSE 5000
+EXPOSE 8080
 
-ENV PORT=5000 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    TF_CPP_MIN_LOG_LEVEL=2
-
-# Gunicorn production server
-CMD ["gunicorn", "app.app:app", \
-     "--bind", "0.0.0.0:5000", \
-     "--workers", "1", \
-     "--threads", "2", \
-     "--timeout", "120", \
-     "--access-logfile", "-"]
+# Shell form so $PORT is expanded (Cloud Run and Render inject it)
+CMD exec gunicorn app.app:app --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 --access-logfile -

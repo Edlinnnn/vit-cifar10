@@ -1,11 +1,14 @@
 """
-train_torch.py
---------------
-PyTorch training script — runs on your RTX 5050 GPU.
+train.py
+--------
+Trains the ViT on CIFAR-10 with AdamW, warm-up + cosine LR, label smoothing,
+gradient clipping and mixed precision (on GPU). Runs on CPU too, just slower.
+
+Original run: 60 epochs on an RTX 5050 -> 77.9% test accuracy.
 
 Usage:
-    python src/train_torch.py
-    python src/train_torch.py --epochs 30    # quick test
+    python src/train.py
+    python src/train.py --epochs 30 --batch-size 128
 """
 
 import os
@@ -19,13 +22,11 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import torchvision
-import torchvision.transforms as transforms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.vit_model import ViT
+from src.vit_model import DEFAULT_CONFIG, build_vit, count_parameters
+from src.data_preprocessing import get_dataloaders, CLASS_NAMES
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -38,62 +39,18 @@ os.makedirs(DOCS_DIR,  exist_ok=True)
 MODEL_PATH   = os.path.join(MODEL_DIR, "vit_cifar10_torch.pth")
 HISTORY_PATH = os.path.join(MODEL_DIR, "training_history_torch.json")
 
-CLASS_NAMES = ["airplane","automobile","bird","cat","deer",
-               "dog","frog","horse","ship","truck"]
-
-
-# ─── Data ─────────────────────────────────────────────────────────────────────
-
-def get_dataloaders(batch_size=128):
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
-    ])
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2023, 0.1994, 0.2010)),
-    ])
-
-    train_full = torchvision.datasets.CIFAR10(
-        root="./data", train=True, download=True, transform=train_transform)
-    test_set = torchvision.datasets.CIFAR10(
-        root="./data", train=False, download=True, transform=test_transform)
-
-    # 90/10 train/val split
-    val_size   = int(0.1 * len(train_full))
-    train_size = len(train_full) - val_size
-    train_set, val_set = random_split(
-        train_full, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    train_loader = DataLoader(train_set, batch_size=batch_size,
-                              shuffle=True,  num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_set,   batch_size=batch_size,
-                              shuffle=False, num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_set,  batch_size=batch_size,
-                              shuffle=False, num_workers=2, pin_memory=True)
-
-    print(f"Train: {len(train_set):,}  |  Val: {len(val_set):,}  |  Test: {len(test_set):,}")
-    return train_loader, val_loader, test_loader
-
-
 # ─── Train / Eval loops ───────────────────────────────────────────────────────
 
 def train_epoch(model, loader, criterion, optimizer, device, scaler):
     model.train()
+    use_amp = device.type == "cuda"
     total_loss, correct, total = 0.0, 0, 0
 
     for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
 
         optimizer.zero_grad()
-        with torch.amp.autocast(device_type="cuda"):   # mixed precision
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):   # mixed precision on GPU
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -113,11 +70,12 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler):
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device):
     model.eval()
+    use_amp = device.type == "cuda"
     total_loss, correct, total = 0.0, 0, 0
 
     for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
-        with torch.amp.autocast(device_type="cuda"):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -154,7 +112,7 @@ def plot_history(history, save_path):
     axes[1].legend(facecolor="#1a1a2e", labelcolor="white")
     axes[1].grid(alpha=0.2, color="white")
 
-    plt.suptitle("ViT Training History (PyTorch · RTX 5050)", color="white", fontsize=13)
+    plt.suptitle("ViT Training History (PyTorch)", color="white", fontsize=13)
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight", dpi=150)
     print(f"Curves saved → {save_path}")
@@ -163,7 +121,7 @@ def plot_history(history, save_path):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def train(epochs=60, base_lr=1e-3, batch_size=128, warmup_epochs=5, patience=15):
+def train(epochs=60, base_lr=1e-3, batch_size=128, warmup_epochs=5, patience=15, num_workers=2):
 
     # ── Device ──
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,15 +133,11 @@ def train(epochs=60, base_lr=1e-3, batch_size=128, warmup_epochs=5, patience=15)
     print(f"{'='*55}\n")
 
     # ── Data ──
-    train_loader, val_loader, _ = get_dataloaders(batch_size)
+    train_loader, val_loader, _ = get_dataloaders(batch_size, num_workers=num_workers)
 
     # ── Model ──
-    model = ViT(image_size=32, patch_size=4, num_classes=10,
-                embed_dim=64, num_heads=8, num_layers=6,
-                mlp_ratio=4.0, dropout=0.1).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,}\n")
+    model = build_vit().to(device)
+    print(f"Parameters: {count_parameters(model):,}\n")
 
     # ── Loss, Optimizer, Scheduler ──
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -198,7 +152,7 @@ def train(epochs=60, base_lr=1e-3, batch_size=128, warmup_epochs=5, patience=15)
                              milestones=[warmup_epochs])
 
     # ── Mixed precision scaler ──
-    scaler = torch.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
 
     # ── Training loop ──
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -230,6 +184,8 @@ def train(epochs=60, base_lr=1e-3, batch_size=128, warmup_epochs=5, patience=15)
             best_val_acc = vl_acc
             torch.save({
                 "epoch":      epoch,
+                "config":     DEFAULT_CONFIG,
+                "class_names": CLASS_NAMES,
                 "model_state_dict": model.state_dict(),
                 "val_acc":    vl_acc,
                 "val_loss":   vl_loss,
@@ -262,7 +218,9 @@ if __name__ == "__main__":
     p.add_argument("--batch-size",     type=int,   default=128)
     p.add_argument("--warmup-epochs",  type=int,   default=5)
     p.add_argument("--patience",       type=int,   default=15)
+    p.add_argument("--num-workers",    type=int,   default=2)
     args = p.parse_args()
 
     train(epochs=args.epochs, base_lr=args.lr, batch_size=args.batch_size,
-          warmup_epochs=args.warmup_epochs, patience=args.patience)
+          warmup_epochs=args.warmup_epochs, patience=args.patience,
+          num_workers=args.num_workers)
