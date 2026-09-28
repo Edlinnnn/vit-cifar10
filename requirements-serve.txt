@@ -1,0 +1,9 @@
+# Minimal runtime for the Flask API (used by Docker / Render / Cloud Run).
+# Install CPU-only torch first to keep the image small:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+torchvision>=0.17
+numpy>=1.26
+Pillow>=10.0
+Flask==3.0.3
+gunicorn==22.0.0

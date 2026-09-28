@@ -1,8 +1,11 @@
 """
-vit_model_torch.py
-------------------
-Vision Transformer (ViT) implemented in PyTorch.
-Equivalent architecture to the Keras version.
+vit_model.py
+------------
+Vision Transformer (ViT) for CIFAR-10, implemented from scratch in PyTorch.
+
+Default config (~327K parameters):
+    32x32 input -> 4x4 patches (64 tokens) + [CLS] -> 6 pre-norm Transformer
+    blocks (embed_dim 64, 8 heads, MLP 256) -> LayerNorm -> MLP head -> 10 logits
 """
 
 import torch
@@ -98,9 +101,26 @@ class ViT(nn.Module):
         return self.head(cls_out)  # logits (no softmax — CrossEntropyLoss handles it)
 
 
+# Single source of truth for the architecture used in training, evaluation and serving.
+DEFAULT_CONFIG = dict(
+    image_size=32, patch_size=4, num_classes=10,
+    embed_dim=64, num_heads=8, num_layers=6,
+    mlp_ratio=4.0, dropout=0.1,
+)
+
+
+def build_vit(**overrides) -> ViT:
+    """Build a ViT with DEFAULT_CONFIG, optionally overriding any argument."""
+    return ViT(**{**DEFAULT_CONFIG, **overrides})
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
 if __name__ == "__main__":
-    model = ViT()
+    model = build_vit()
     dummy = torch.randn(4, 3, 32, 32)
     out   = model(dummy)
-    print(f"Output shape: {out.shape}")   # (4, 10)
-    print(f"Parameters:   {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Output shape: {tuple(out.shape)}")   # (4, 10)
+    print(f"Parameters:   {count_parameters(model):,}")

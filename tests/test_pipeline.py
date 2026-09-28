@@ -1,213 +1,200 @@
 """
 test_pipeline.py
 ----------------
-Unit tests for the ViT CIFAR-10 pipeline.
+Unit tests for the ViT CIFAR-10 pipeline (PyTorch). No dataset download or GPU needed.
 
 Run with:
     pytest tests/ -v
 """
 
+import io
 import os
 import sys
-import numpy as np
+
 import pytest
+import torch
+from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-# ─── Data tests ───────────────────────────────────────────────────────────────
-
-class TestDataPreprocessing:
-
-    def test_load_returns_correct_shapes(self):
-        from src.data_preprocessing import load_cifar10
-        (x_tr, y_tr), (x_val, y_val), (x_te, y_te) = load_cifar10()
-
-        assert x_tr.shape[1:]  == (32, 32, 3)
-        assert x_val.shape[1:] == (32, 32, 3)
-        assert x_te.shape      == (10000, 32, 32, 3)
-
-        assert len(x_tr) + len(x_val) == 50000
-        assert len(x_te)              == 10000
-
-    def test_pixel_range(self):
-        from src.data_preprocessing import load_cifar10
-        (x_tr, _), _, (x_te, _) = load_cifar10()
-        assert x_tr.min() >= 0.0
-        assert x_tr.max() <= 1.0
-        assert x_te.min() >= 0.0
-        assert x_te.max() <= 1.0
-
-    def test_label_range(self):
-        from src.data_preprocessing import load_cifar10
-        (_, y_tr), (_, y_val), (_, y_te) = load_cifar10()
-        for y in [y_tr, y_val, y_te]:
-            assert y.min() >= 0
-            assert y.max() <= 9
-
-    def test_dataset_pipeline_batches(self):
-        import tensorflow as tf
-        from src.data_preprocessing import make_dataset
-        x = np.random.rand(200, 32, 32, 3).astype("float32")
-        y = np.random.randint(0, 10, 200)
-        ds = make_dataset(x, y, augment=False, batch_size=32)
-        batch_imgs, batch_lbls = next(iter(ds))
-        assert batch_imgs.shape == (32, 32, 32, 3)
-        assert batch_lbls.shape == (32,)
-
-    def test_augmented_dataset_same_shape(self):
-        import tensorflow as tf
-        from src.data_preprocessing import make_dataset
-        x = np.random.rand(64, 32, 32, 3).astype("float32")
-        y = np.random.randint(0, 10, 64)
-        ds = make_dataset(x, y, augment=True, batch_size=16)
-        batch_imgs, batch_lbls = next(iter(ds))
-        assert batch_imgs.shape == (16, 32, 32, 3)
+from src.vit_model import (DEFAULT_CONFIG, PatchEmbedding, TransformerBlock,
+                           build_vit, count_parameters)
+from src.data_preprocessing import CLASS_NAMES, eval_transform, train_transform
+from src.inference import load_model, preprocess_image, predict_probs, top_k
 
 
-# ─── Model tests ──────────────────────────────────────────────────────────────
+def png_bytes(size=(64, 64), color=(100, 150, 200)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color=color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def checkpoint(tmp_path):
+    """A randomly initialised checkpoint in the same format train.py writes."""
+    torch.manual_seed(0)
+    model = build_vit()
+    path = tmp_path / "vit.pth"
+    torch.save({"epoch": 1, "config": DEFAULT_CONFIG, "class_names": CLASS_NAMES,
+                "model_state_dict": model.state_dict(), "val_acc": 0.1, "val_loss": 2.3}, path)
+    return str(path)
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
 
 class TestViTModel:
 
     def test_output_shape(self):
-        from src.vit_model import build_vit
-        model = build_vit(image_size=32, patch_size=4, num_classes=10,
-                          embed_dim=32, num_heads=4, num_layers=2)
-        dummy = np.random.rand(4, 32, 32, 3).astype("float32")
-        out   = model(dummy, training=False)
+        out = build_vit()(torch.randn(4, 3, 32, 32))
         assert out.shape == (4, 10)
 
-    def test_output_sums_to_one(self):
-        from src.vit_model import build_vit
-        model = build_vit(image_size=32, patch_size=4, num_classes=10,
-                          embed_dim=32, num_heads=4, num_layers=2)
-        dummy = np.random.rand(8, 32, 32, 3).astype("float32")
-        out   = model(dummy, training=False).numpy()
-        np.testing.assert_allclose(out.sum(axis=-1), np.ones(8), atol=1e-5)
+    def test_parameter_count(self):
+        assert count_parameters(build_vit()) == 326_602
 
-    def test_all_probs_in_range(self):
-        from src.vit_model import build_vit
-        model = build_vit(image_size=32, patch_size=4, num_classes=10,
-                          embed_dim=32, num_heads=4, num_layers=2)
-        dummy = np.random.rand(4, 32, 32, 3).astype("float32")
-        out   = model(dummy, training=False).numpy()
-        assert (out >= 0).all() and (out <= 1).all()
+    def test_softmax_of_logits_sums_to_one(self):
+        model = build_vit().eval()
+        with torch.no_grad():
+            probs = torch.softmax(model(torch.randn(8, 3, 32, 32)), dim=-1)
+        torch.testing.assert_close(probs.sum(dim=-1), torch.ones(8))
+        assert ((probs >= 0) & (probs <= 1)).all()
 
     def test_patch_embed_shape(self):
-        from src.vit_model import PatchEmbedding
-        pe = PatchEmbedding(image_size=32, patch_size=4, embed_dim=64)
-        dummy = np.random.rand(2, 32, 32, 3).astype("float32")
-        out   = pe(dummy)
-        # (32/4)^2 = 64 patches
-        assert out.shape == (2, 64, 64)
+        out = PatchEmbedding(image_size=32, patch_size=4, embed_dim=64)(torch.randn(2, 3, 32, 32))
+        assert out.shape == (2, 64, 64)          # (32/4)^2 = 64 patches of dim 64
 
-    def test_positional_embedding_shape(self):
-        from src.vit_model import AddPositionalEmbedding
-        ape = AddPositionalEmbedding(num_patches=64, embed_dim=64)
-        dummy = np.zeros((3, 64, 64), dtype="float32")
-        out   = ape(dummy)
-        # Should prepend [CLS]: 64 + 1 = 65 tokens
-        assert out.shape == (3, 65, 64)
+    def test_cls_token_and_positions(self):
+        model = build_vit()
+        assert model.cls_token.shape == (1, 1, 64)
+        assert model.pos_embed.shape == (1, 65, 64)   # 64 patches + [CLS]
 
-    def test_transformer_block_residual(self):
-        from src.vit_model import TransformerBlock
-        block = TransformerBlock(embed_dim=32, num_heads=4, mlp_dim=64)
-        dummy = np.random.rand(2, 10, 32).astype("float32")
-        out   = block(dummy, training=False)
-        assert out.shape == (2, 10, 32)
+    def test_transformer_block_keeps_shape(self):
+        block = TransformerBlock(embed_dim=32, num_heads=4, mlp_dim=64).eval()
+        assert block(torch.randn(2, 10, 32)).shape == (2, 10, 32)
 
-    def test_different_patch_sizes(self):
-        from src.vit_model import build_vit
-        for ps in [2, 4, 8]:
-            model = build_vit(image_size=32, patch_size=ps, num_classes=10,
-                              embed_dim=32, num_heads=4, num_layers=1)
-            dummy = np.random.rand(2, 32, 32, 3).astype("float32")
-            out   = model(dummy, training=False)
-            assert out.shape == (2, 10), f"Failed for patch_size={ps}"
+    @pytest.mark.parametrize("patch_size", [2, 4, 8])
+    def test_different_patch_sizes(self, patch_size):
+        model = build_vit(patch_size=patch_size, embed_dim=32, num_heads=4, num_layers=1)
+        assert model(torch.randn(2, 3, 32, 32)).shape == (2, 10)
+
+    def test_backward_pass(self):
+        model = build_vit(embed_dim=32, num_heads=4, num_layers=1)
+        loss = torch.nn.functional.cross_entropy(model(torch.randn(4, 3, 32, 32)),
+                                                 torch.tensor([0, 1, 2, 3]))
+        loss.backward()
+        assert model.patch_embed.projection.weight.grad is not None
 
 
-# ─── App tests (no model needed — uses demo endpoint) ────────────────────────
+# ─── Transforms ───────────────────────────────────────────────────────────────
+
+class TestTransforms:
+
+    def test_eval_transform_resizes_and_normalises(self):
+        x = eval_transform()(Image.new("RGB", (256, 128), color=(255, 0, 0)))
+        assert x.shape == (3, 32, 32)
+        assert x[0].mean() > 1.5 and x[1].mean() < 0     # red channel high, green low after normalise
+
+    def test_train_transform_shape(self):
+        x = train_transform()(Image.new("RGB", (32, 32), color=(10, 20, 30)))
+        assert x.shape == (3, 32, 32)
+
+
+# ─── Inference helpers ────────────────────────────────────────────────────────
+
+class TestInference:
+
+    def test_preprocess_output_shape(self):
+        assert preprocess_image(png_bytes((256, 256))).shape == (1, 3, 32, 32)
+
+    def test_preprocess_accepts_rgba_and_grayscale(self):
+        for mode in ("RGBA", "L"):
+            buf = io.BytesIO()
+            Image.new(mode, (40, 40)).save(buf, format="PNG")
+            assert preprocess_image(buf.getvalue()).shape == (1, 3, 32, 32)
+
+    def test_load_checkpoint_and_predict(self, checkpoint):
+        model, device, ckpt = load_model(checkpoint, device=torch.device("cpu"))
+        assert not model.training and ckpt["epoch"] == 1
+        probs = predict_probs(model, preprocess_image(png_bytes()), device)
+        assert len(probs) == 10 and abs(sum(probs) - 1) < 1e-5
+
+    def test_load_bare_state_dict(self, tmp_path):
+        path = tmp_path / "bare.pth"
+        torch.save(build_vit().state_dict(), path)
+        model, _, _ = load_model(str(path), device=torch.device("cpu"))
+        assert count_parameters(model) == 326_602
+
+    def test_missing_model_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_model(str(tmp_path / "nope.pth"))
+
+    def test_top_k(self):
+        probs = [0.0] * 10
+        probs[5], probs[3], probs[1] = 0.6, 0.3, 0.1
+        assert [c for c, _ in top_k(probs, 3)] == ["dog", "cat", "automobile"]
+
+
+# ─── Flask app ────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def app_module():
+    import app.app as app_module
+    app_module.app.config["TESTING"] = True
+    app_module._model, app_module._device = None, None
+    yield app_module
+    app_module._model, app_module._device = None, None
+
+
+@pytest.fixture
+def client(app_module):
+    with app_module.app.test_client() as c:
+        yield c
+
 
 class TestFlaskApp:
 
-    @pytest.fixture
-    def client(self):
-        import importlib
-        # Patch model loading to avoid needing a saved model
-        app_module = importlib.import_module("app.app")
-        app_module.app.config["TESTING"] = True
-        with app_module.app.test_client() as c:
-            yield c
-
     def test_index_200(self, client):
-        resp = client.get("/")
-        assert resp.status_code == 200
+        assert client.get("/").status_code == 200
 
     def test_health(self, client):
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        data = resp.get_json()
+        data = client.get("/health").get_json()
         assert data["status"] == "ok"
 
     def test_classes_endpoint(self, client):
-        resp = client.get("/classes")
-        assert resp.status_code == 200
-        data = resp.get_json()
-        assert len(data["classes"]) == 10
+        assert len(client.get("/classes").get_json()["classes"]) == 10
 
     def test_predict_no_file_400(self, client):
-        resp = client.post("/predict")
+        assert client.post("/predict").status_code == 400
+
+    def test_predict_bad_extension_415(self, client):
+        resp = client.post("/predict", data={"image": (io.BytesIO(b"x"), "notes.txt")},
+                           content_type="multipart/form-data")
+        assert resp.status_code == 415
+
+    def test_predict_without_model_503(self, client, app_module, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, "MODEL_PATH", str(tmp_path / "missing.pth"))
+        resp = client.post("/predict", data={"image": (io.BytesIO(png_bytes()), "a.png")},
+                           content_type="multipart/form-data")
+        assert resp.status_code == 503
+
+    def test_predict_with_model(self, client, app_module, checkpoint, monkeypatch):
+        monkeypatch.setattr(app_module, "MODEL_PATH", checkpoint)
+        resp = client.post("/predict", data={"image": (io.BytesIO(png_bytes()), "a.png")},
+                           content_type="multipart/form-data")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["class"] in CLASS_NAMES
+        assert len(data["probabilities"]) == 10 and len(data["top3"]) == 3
+        assert abs(sum(data["probabilities"].values()) - 1) < 1e-4
+
+    def test_predict_corrupt_image_400(self, client, app_module, checkpoint, monkeypatch):
+        monkeypatch.setattr(app_module, "MODEL_PATH", checkpoint)
+        resp = client.post("/predict", data={"image": (io.BytesIO(b"not an image"), "a.png")},
+                           content_type="multipart/form-data")
         assert resp.status_code == 400
 
     def test_demo_predict(self, client):
-        """Demo endpoint returns plausible fake data without a real model."""
-        import io
-        from PIL import Image as PILImage
-        # Create a tiny in-memory PNG
-        img = PILImage.new("RGB", (32, 32), color=(100, 150, 200))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-
-        resp = client.post(
-            "/predict/demo",
-            data={"image": (buf, "test.png")},
-            content_type="multipart/form-data"
-        )
-        assert resp.status_code == 200
+        resp = client.post("/predict/demo", data={"image": (io.BytesIO(png_bytes()), "t.png")},
+                           content_type="multipart/form-data")
         data = resp.get_json()
-        assert "class"         in data
-        assert "confidence"    in data
-        assert "probabilities" in data
+        assert resp.status_code == 200 and data["demo"] is True
         assert len(data["probabilities"]) == 10
-        assert data["demo"] is True
-
-
-# ─── Image preprocessing tests ───────────────────────────────────────────────
-
-class TestPreprocessing:
-
-    def test_preprocess_output_shape(self):
-        import io
-        from PIL import Image as PILImage
-        from app.app import preprocess_image
-
-        img = PILImage.new("RGB", (256, 256), color=(255, 0, 0))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        out = preprocess_image(buf.getvalue())
-
-        assert out.shape == (1, 32, 32, 3)
-
-    def test_preprocess_normalised(self):
-        import io
-        from PIL import Image as PILImage
-        from app.app import preprocess_image
-
-        img = PILImage.new("RGB", (64, 64), color=(255, 255, 255))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        out = preprocess_image(buf.getvalue())
-
-        assert out.max() <= 1.0
-        assert out.min() >= 0.0

@@ -1,7 +1,7 @@
 """
 app.py
 ------
-Flask REST API for the ViT CIFAR-10 image classifier.
+Flask REST API for the ViT CIFAR-10 image classifier (PyTorch).
 
 Endpoints:
     GET  /              → Web UI
@@ -12,27 +12,24 @@ Endpoints:
 Run locally:
     python app/app.py
 
-Production (Render / Railway):
+Production (Render / Cloud Run / any Docker host):
     gunicorn app.app:app --bind 0.0.0.0:$PORT
 """
 
 import os
 import sys
-import io
-import json
-import base64
 import logging
-import numpy as np
-from PIL import Image
+import threading
 
-# ─── TensorFlow (lazy import so startup is fast on serverless) ────────────────
-import tensorflow as tf
-from tensorflow import keras
+import torch
 
 # Allow imports from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask import Flask, request, jsonify, render_template
+
+from src.data_preprocessing import CLASS_NAMES
+from src.inference import DEFAULT_MODEL_PATH, load_model, preprocess_image, predict_probs, top_k
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -40,13 +37,12 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(ROOT, "models", "vit_cifar10.keras")
+MODEL_PATH = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)
+MAX_UPLOAD_MB = 10
+ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
-CLASS_NAMES = [
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck"
-]
+# Small model: a couple of CPU threads is plenty and keeps memory low on free tiers.
+torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "2")))
 
 CLASS_EMOJI = {
     "airplane":    "✈️",  "automobile": "🚗",  "bird":  "🐦",
@@ -55,43 +51,61 @@ CLASS_EMOJI = {
     "truck":       "🚛",
 }
 
-IMAGE_SIZE = 32
-
 # ─── App factory ──────────────────────────────────────────────────────────────
 
 app = Flask(__name__,
             template_folder = os.path.join(os.path.dirname(__file__), "templates"),
             static_folder   = os.path.join(os.path.dirname(__file__), "static"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
-# Global model holder (loaded once on first request)
-_model = None
+# Global model holder (loaded once, on first request, thread-safe)
+_model, _device = None, None
+_lock = threading.Lock()
 
 
 def get_model():
-    global _model
+    global _model, _device
     if _model is None:
-        if not os.path.exists(MODEL_PATH):
-            raise RuntimeError(
-                f"Model not found at {MODEL_PATH}. "
-                "Please run  python src/train.py  first."
-            )
-        logger.info("Loading ViT model …")
-        _model = keras.models.load_model(MODEL_PATH)
-        logger.info("Model loaded ✓")
-    return _model
+        with _lock:
+            if _model is None:
+                logger.info("Loading ViT model from %s …", MODEL_PATH)
+                _model, _device, _ = load_model(MODEL_PATH)
+                logger.info("Model loaded ✓ on %s", _device)
+    return _model, _device
 
 
-# ─── Image preprocessing ──────────────────────────────────────────────────────
+def build_response(probs, demo=False):
+    pred_idx = max(range(len(probs)), key=lambda i: probs[i])
+    pred_cls = CLASS_NAMES[pred_idx]
+    body = {
+        "class":         pred_cls,
+        "emoji":         CLASS_EMOJI.get(pred_cls, ""),
+        "confidence":    float(probs[pred_idx]),
+        "probabilities": {c: round(float(p), 6) for c, p in zip(CLASS_NAMES, probs)},
+        "top3":          [{"class": c, "emoji": CLASS_EMOJI.get(c, ""),
+                           "confidence": round(p * 100, 1)} for c, p in top_k(probs, 3)],
+    }
+    if demo:
+        body["demo"] = True
+    return body
 
-def preprocess_image(file_bytes: bytes) -> np.ndarray:
-    """
-    Accepts raw image bytes, returns a (1, 32, 32, 3) float32 array
-    normalised to [0, 1].
-    """
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
-    arr = np.array(img, dtype="float32") / 255.0
-    return arr[np.newaxis, ...]   # add batch dimension
+
+def validate_upload():
+    """Return (file, None) or (None, (json, status))."""
+    if "image" not in request.files:
+        return None, (jsonify({"error": "No image field in request"}), 400)
+    file = request.files["image"]
+    if file.filename == "":
+        return None, (jsonify({"error": "Empty filename"}), 400)
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXT:
+        return None, (jsonify({"error": f"Unsupported file type: {ext}"}), 415)
+    return file, None
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify({"error": f"File too large (max {MAX_UPLOAD_MB} MB)"}), 413
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -103,7 +117,9 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "model_loaded": _model is not None})
+    return jsonify({"status": "ok",
+                    "model_loaded": _model is not None,
+                    "model_available": os.path.exists(MODEL_PATH)})
 
 
 @app.route("/classes")
@@ -123,47 +139,25 @@ def predict():
           "probabilities": {"airplane": 0.01, "dog": 0.92, ...}
         }
     """
-    # ── Validate request ──
-    if "image" not in request.files:
-        return jsonify({"error": "No image field in request"}), 400
+    file, err = validate_upload()
+    if err:
+        return err
 
-    file = request.files["image"]
-    if file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
-
-    allowed_ext = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_ext:
-        return jsonify({"error": f"Unsupported file type: {ext}"}), 415
-
-    # ── Inference ──
     try:
-        raw = file.read()
-        img = preprocess_image(raw)
+        model, device = get_model()
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        return jsonify({"error": "Model not loaded on the server. "
+                                 "Add models/vit_cifar10_torch.pth and restart."}), 503
 
-        model = get_model()
-        probs = model(img, training=False).numpy()[0]   # (10,)
+    try:
+        x = preprocess_image(file.read())
+    except Exception:
+        return jsonify({"error": "Could not read that file as an image"}), 400
 
-        pred_idx  = int(np.argmax(probs))
-        pred_cls  = CLASS_NAMES[pred_idx]
-        confidence = float(probs[pred_idx])
-
-        prob_dict = {cls: round(float(p), 6)
-                     for cls, p in zip(CLASS_NAMES, probs)}
-
-        # Top-3 for UI
-        top3 = sorted(prob_dict.items(), key=lambda x: x[1], reverse=True)[:3]
-
-        return jsonify({
-            "class":         pred_cls,
-            "emoji":         CLASS_EMOJI.get(pred_cls, ""),
-            "confidence":    confidence,
-            "probabilities": prob_dict,
-            "top3":          [{"class": c, "emoji": CLASS_EMOJI.get(c, ""),
-                               "confidence": round(p * 100, 1)}
-                              for c, p in top3],
-        })
-
+    try:
+        probs = predict_probs(model, x, device)
+        return jsonify(build_response(probs))
     except Exception as exc:
         logger.exception("Prediction failed")
         return jsonify({"error": str(exc)}), 500
@@ -176,24 +170,10 @@ def predict_demo():
     """Returns plausible fake predictions. Useful for UI testing without a trained model."""
     import random
     pred_idx  = random.randint(0, 9)
-    pred_cls  = CLASS_NAMES[pred_idx]
-    raw_probs = np.abs(np.random.randn(10))
-    raw_probs[pred_idx] *= 5
-    probs = (raw_probs / raw_probs.sum()).tolist()
-
-    prob_dict = {cls: round(float(p), 6) for cls, p in zip(CLASS_NAMES, probs)}
-    top3 = sorted(prob_dict.items(), key=lambda x: x[1], reverse=True)[:3]
-
-    return jsonify({
-        "class":         pred_cls,
-        "emoji":         CLASS_EMOJI.get(pred_cls, ""),
-        "confidence":    max(probs),
-        "probabilities": prob_dict,
-        "top3":          [{"class": c, "emoji": CLASS_EMOJI.get(c, ""),
-                           "confidence": round(p * 100, 1)}
-                          for c, p in top3],
-        "demo":          True
-    })
+    raw = [abs(random.gauss(0, 1)) for _ in range(10)]
+    raw[pred_idx] *= 5
+    total = sum(raw)
+    return jsonify(build_response([r / total for r in raw], demo=True))
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
